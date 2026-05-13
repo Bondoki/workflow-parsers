@@ -68,8 +68,6 @@ from electronicparsers.vasp import VASPParser
 from .metainfo import aflow  # noqa
 
 
-# ---- Constants ----
-
 # Regex matching all AFLOW VASP output filenames:
 #   vasprun.xml.relax1.xz, vasprun.xml.static.bz2, vasprun.xml.bands.xz, ...
 AFLOW_VASPRUN_RE = re.compile(
@@ -89,9 +87,6 @@ VASP_RUN_ROLES = {
 
 # Modules with dedicated parse_* methods in AFLOWParser
 AFLOW_MODULE_PARSERS = {'ael', 'agl', 'apl'}
-
-
-# ---- File-level helpers ----
 
 
 def find_vasp_runs(maindir):
@@ -202,9 +197,6 @@ def parse_vasp_archive(filepath, logger):
     return child
 
 
-# ---- Text parsers ----
-
-
 class AflowOutParser(TextParser):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -212,10 +204,9 @@ class AflowOutParser(TextParser):
     def init_quantities(self):
         def str_to_property(val_in):
             val = val_in.split('=')
-            return (
-                val[0].strip().replace(' ', '_').lower(),
-                val[-1].split('//')[0].strip(),
-            )
+            return val[0].strip().replace(' ', '_').lower(), val[-1].split('//')[
+                0
+            ].strip()
 
         self._quantities = [
             Quantity(
@@ -249,11 +240,14 @@ class AflowOutParser(TextParser):
 
     def parse(self, key=None):
         super().parse(key)
-        for prop in self._results.get('property', []):
-            self._results[prop[0]] = prop[1]
+        for property in self._results.get('property', []):
+            self._results[property[0]] = property[1]
         for section in self._results.get('section', []):
             if section.key_value is not None:
-                self._results[section.name] = dict(section.get('key_value', []))
+                result = dict()
+                for k, v in section.get('key_value', []):
+                    result[k] = v
+                self._results[section.name] = result
             elif section.array is not None:
                 self._results[section.name] = section.array
 
@@ -265,16 +259,13 @@ class AflowInParser(AflowOutParser):
     def init_quantities(self):
         super().init_quantities()
         self._quantities += [
-            # AFLOW version
             Quantity('aflow_version', r'Stefano Curtarolo \- \(AFLOW V([\d\.]+)\)'),
-            # [VASP_RUN] directive - captures e.g. 'RELAX_STATIC_BANDS=2'
             Quantity(
                 'vasp_run',
                 r'\[VASP_RUN\](\S+)',
                 dtype=str,
                 convert=False,
             ),
-            # POSCAR embedded in aflow.in
             Quantity(
                 'poscar',
                 r'\[VASP_POSCAR_MODE_EXPLICIT\]START\s*([\s\S]+?)\[VASP_POSCAR_MODE_EXPLICIT\]STOP',
@@ -282,7 +273,6 @@ class AflowInParser(AflowOutParser):
                 convert=False,
                 repeats=True,
             ),
-            # Composition line
             Quantity(
                 'aflow_composition',
                 r'\[AFLOW\] COMPOSITION=(\S+)',
@@ -299,7 +289,6 @@ class AflowInParser(AflowOutParser):
                 ),
             ),
         ] + [
-            # One Quantity per optional AFLOW module
             Quantity(
                 module.lower(),
                 r'\n *\[AFLOW\_%s\]CALC([\s\S]+?)\[AFLOW\] \*' % module,
@@ -342,9 +331,6 @@ class AflowInParser(AflowOutParser):
                 for module in ['ael', 'agl', 'apl', 'qha', 'aapl']
                 if module in self._results
             ]
-
-
-# ---- Main parser ----
 
 
 class AFLOWParser:
@@ -420,13 +406,9 @@ class AFLOWParser:
                 positions = [atom.get('position') for atom in struc.get('atoms', [])]
                 if struc.get('coordinates_type', 'direct').lower().startswith('d'):
                     if sec_system.atoms.lattice_vectors is not None:
-                        positions = (
-                            np.dot(
-                                positions,
-                                sec_system.atoms.lattice_vectors.magnitude,
-                            )
-                            * sec_system.atoms.lattice_vectors.units
-                        )
+                        positions = np.dot(
+                            positions, sec_system.atoms.lattice_vectors.magnitude
+                        ) * sec_system.atoms.lattice_vectors.units
                 sec_system.atoms.positions = positions
 
     def parse_agl(self):
@@ -464,6 +446,13 @@ class AFLOWParser:
         workflow.results.heat_capacity_c_p = (
             thermal_properties[5] * ureg.boltzmann_constant
         )
+        # TODO add these to metainfo def
+        # workflow.results.thermal_conductivity = thermal_properties[1] * ureg.watt / ureg.m * ureg.K
+        # sec_debye.debye_temperature = thermal_properties[2] * ureg.K
+        # sec_debye.gruneisen_parameter = thermal_properties[3]
+        # sec_debye.thermal_expansion = thermal_properties[6] / ureg.K
+        # sec_debye.bulk_modulus_static = thermal_properties[7] * ureg.GPa
+        # sec_debye.bulk_modulus_isothermal = thermal_properties[8] * ureg.GPa
         self.archive.workflow2 = workflow
 
     def parse_ael(self):
@@ -507,6 +496,7 @@ class AFLOWParser:
             workflow.results.elastic_constants_matrix_second_order = (
                 np.reshape(self.ael_parser.ael_stiffness_tensor, (6, 6)) * ureg.GPa
             )
+
         if self.ael_parser.ael_compliance_tensor is not None:
             workflow.results.compliance_matrix_second_order = np.reshape(
                 self.ael_parser.ael_compliance_tensor, (6, 6)
@@ -553,11 +543,7 @@ class AFLOWParser:
             bandstructure = bandstructure[2:]
             bandstructure = np.reshape(
                 bandstructure,
-                (
-                    len(bandstructure),
-                    len(bandstructure[0]) // n_kpoints,
-                    n_kpoints,
-                ),
+                (len(bandstructure), len(bandstructure[0]) // n_kpoints, n_kpoints),
             )
             bandstructure = np.transpose(bandstructure, axes=(1, 2, 0))
         except Exception:
@@ -583,6 +569,7 @@ class AFLOWParser:
         )
 
         workflow = Phonon(method=PhononMethod(), results=PhononResults())
+
         workflow.method.force_calculator = 'vasp'
         mesh = self.aflowin_parser.get('aflow_apl_dosmesh')
         if mesh is not None:
@@ -601,8 +588,7 @@ class AFLOWParser:
                 qpoints = self.apl_parser.apl_qpoints
                 qpoints = np.reshape(qpoints, (len(qpoints) // 4, 4))
                 group_velocity = np.reshape(
-                    group_velocity,
-                    (len(qpoints), len(group_velocity) // len(qpoints)),
+                    group_velocity, (len(qpoints), len(group_velocity) // len(qpoints))
                 )
                 group_velocity = np.transpose(np.transpose(group_velocity)[1:])
                 workflow.results.qpoints = np.transpose(np.transpose(qpoints)[1:])
@@ -621,6 +607,7 @@ class AFLOWParser:
             'aflow.apl.thermodynamic_properties.out.xz'
         )
         apl_thermo = self.apl_parser.get('apl_thermo')
+        # TODO handle multiple workflows
         if apl_thermo is not None:
             apl_thermo = np.transpose(np.reshape(apl_thermo, (len(apl_thermo) // 6, 6)))
             sec_thermo = WorkflowThermodynamics(results=ThermodynamicsResults())
@@ -635,6 +622,11 @@ class AFLOWParser:
             )
 
         self.archive.workflow2 = workflow
+
+        # TODO parse systems for each displacements
+
+        # TODO parse displacements, force constants, dynamical matrix
+
 
     # ---- VASP run workflow helpers ----
 
@@ -759,7 +751,6 @@ class AFLOWParser:
         vasp_runs,
         child_archives,
         upload_prefix,
-        active_modules,
     ):
         """
         Construct a workflow2 on the aflow.in archive using string-path
@@ -770,13 +761,7 @@ class AFLOWParser:
         rather than receiving live Python objects (which cause the
         ``qualified_name`` AttributeError).
         """
-        module_str = (
-            '+'
-            + '+'.join(m.upper() for m in active_modules if m in AFLOW_MODULE_PARSERS)
-            if active_modules
-            else ''
-        )
-        workflow = Workflow(name=f'AFLOW {workflow_type}{module_str} Workflow')
+        workflow = Workflow(name=f'AFLOW {workflow_type} Workflow')
 
         # Pre-compute entry IDs for all roles that have a file on disk
         entry_ids = {}
@@ -879,7 +864,7 @@ class AFLOWParser:
 
     # Top-level VASP run orchestration
 
-    def parse_vasp_runs(self, active_modules):
+    def parse_vasp_runs(self):
         """
         1. Read ``[VASP_RUN]`` from *aflow.in* to determine the workflow type
            and expected roles.
@@ -944,7 +929,6 @@ class AFLOWParser:
             n_relax=n_relax,
             roles=roles,
             upload_prefix=upload_prefix,
-            active_modules=active_modules,
         )
 
         child_archives = {}
@@ -970,10 +954,8 @@ class AFLOWParser:
             vasp_runs,
             child_archives,
             upload_prefix,
-            active_modules,
         )
 
-    # Main entry point
     def parse(self, filepath, archive, logger):
         self.filepath = os.path.abspath(filepath)
         self.archive = archive
@@ -985,12 +967,12 @@ class AFLOWParser:
         sec_run = Run()
         self.archive.run.append(sec_run)
         sec_run.program = Program(
-            name='AFlow',
-            version=self.aflow_data.get('aflow_version', 'unknown'),
+            name='AFlow', version=self.aflow_data.get('aflow_version', 'unknown')
         )
 
-        # Run-level metadata
-        for key in ['aurl', 'auid', 'data_api', 'data_source', 'loop']:
+        # parse run metadata
+        run_quantities = ['aurl', 'auid', 'data_api', 'data_source', 'loop']
+        for key in run_quantities:
             val = self.aflow_data.get(key)
             if val is not None:
                 setattr(sec_run, 'x_aflow_%s' % key, val)
@@ -1014,7 +996,7 @@ class AFLOWParser:
                 self.aflow_data.get('positions_cartesian') * ureg.angstrom
             )
 
-        # System metadata
+        # parse system metadata from aflow_data
         system_quantities = [
             'compound',
             'prototype',
@@ -1106,7 +1088,7 @@ class AFLOWParser:
                     sec_system.m_get_quantity_definition(f'x_aflow_{key}'), val
                 )
 
-        # Method metadata
+        # parse method metadata from self.aflow_data
         method_quantities = [
             'code',
             'species_pp',
@@ -1139,20 +1121,19 @@ class AFLOWParser:
                     sec_method.m_get_quantity_definition(f'x_aflow_{key}'), val
                 )
 
-        # basic calculation quantities
+        # parse basic calculation quantities from self.aflow_data
         sec_scc = Calculation()
         sec_run.calculation.append(sec_scc)
         sec_scc.energy = Energy()
         sec_scc.forces = Forces()
         sec_thermo = Thermodynamics()
         sec_scc.thermodynamics.append(sec_thermo)
-
         if self.aflow_data.get('energy_cell') is not None:
-            sec_scc.energy.total = energyEntry(
+            sec_scc.energy.total = EnergyEntry(
                 value=self.aflow_data['energy_cell'] * ureg.eV
             )
         if self.aflow_data.get('forces') is not None:
-            sec_scc.forces.total = forcesEntry(
+            sec_scc.forces.total = ForcesEntry(
                 value=self.aflow_data['forces'] * ureg.eV / ureg.angstrom
             )
         if self.aflow_data.get('enthalpy_cell') is not None:
@@ -1161,20 +1142,19 @@ class AFLOWParser:
             sec_thermo.entropy = self.aflow_data['entropy_cell'] * ureg.eV / ureg.K
         if self.aflow_data.get('calculation_time') is not None:
             sec_scc.time_calculation = self.aflow_data['calculation_time'] * ureg.s
-
         calculation_quantities = [
             'stress_tensor',
             'pressure_residual',
-            'pulay_stress',
-            'egap',
-            'egap_fit',
-            'egap_type',
+            'Pulay_stress',
+            'Egap',
+            'Egap_fit',
+            'Egap_type',
             'enthalpy_formation_cell',
             'entropic_temperature',
-            'pv',
+            'PV',
             'spin_cell',
-            'spind',
-            'spinf',
+            'spinD',
+            'spinF',
             'calculation_memory',
             'calculation_cores',
             'nbondxx',
@@ -1182,9 +1162,9 @@ class AFLOWParser:
             'agl_debye',
             'agl_acoustic_debye',
             'agl_gruneisen',
-            'agl_heat_capacity_cv_300k',
-            'agl_heat_capacity_cp_300k',
-            'agl_thermal_expansion_300k',
+            'agl_heat_capacity_Cv_300K',
+            'agl_heat_capacity_Cp_300K',
+            'agl_thermal_expansion_300K',
             'agl_bulk_modulus_static_300K',
             'agl_bulk_modulus_isothermal_300K',
             'agl_poisson_ratio_source',
@@ -1214,10 +1194,10 @@ class AFLOWParser:
             'bader_atomic_volumes',
             'n_files',
             'files',
-            'node_cpu_model',
-            'node_cpu_cores',
-            'node_cpu_mhz',
-            'node_ram_gb',
+            'node_CPU_Model',
+            'node_CPU_Cores',
+            'node_CPU_MHz',
+            'node_RAM_GB',
             'catalog',
             'aflowlib_version',
             'aflowlib_date',
@@ -1227,9 +1207,21 @@ class AFLOWParser:
             if val is not None:
                 setattr(sec_scc, 'x_aflow_%s' % key, val)
 
-        # optional aflow modules (aeL, AGL, APL)
-        active_modules = self.aflow_data.get('loop', [])
-        for module in active_modules:
+        # TODO: ARUN subdirectory workflow linking
+        # AEL, AGL, and APL module runs create ARUN.* subdirectories each
+        # containing their own aflow.in and vasprun.xml.static.xz. These are
+        # currently parsed as independent entries. Future work:
+        #   - parse_ael(): discover ARUN.AEL_* entries, build a nested Workflow linking
+        #     each deformation VASP run as a task, with the stiffness tensor as output.
+        #   - parse_apl(): discover ARUN.APL_* entries, link each displacement VASP run
+        #     as a task feeding into the force constants / phonon dispersion output.
+        #   - parse_agl(): similar ..
+        #   - In each case, the nested module workflow should be referenced as a task
+        #     inside the top-level aflow.in workflow2, parallel to the VASP_RUN tasks.
+        #   - The [VASP_RUN] sequence (relax/static/bands) and these module workflows
+        #     are orthogonal — the VASP_RUN workflow does not need to know about them.
+
+        for module in self.aflow_data.get('loop', []):
             if module == 'ael':
                 self.parse_ael()
             elif module == 'agl':
@@ -1238,4 +1230,4 @@ class AFLOWParser:
                 self.parse_apl()
 
         # VASP runs: workflow2 + DOS+bands combination
-        self.parse_vasp_runs(active_modules)
+        self.parse_vasp_runs()
