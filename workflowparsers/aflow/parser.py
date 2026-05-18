@@ -651,7 +651,8 @@ class AFLOWParser:
         bs_list = []
         if bands_child.run and bands_child.run[-1].calculation:
             bs_list = bands_child.run[-1].calculation[-1].band_structure_electronic
-
+            efermi = bands_child.run[-1].calculation[-1].energy.fermi
+  
         if not bs_list:
             self.logger.warning(
                 'No band_structure_electronic in bands run - '
@@ -663,17 +664,15 @@ class AFLOWParser:
         dos_list = []
         if dos_source is not None and dos_source.run and dos_source.run[-1].calculation:
             dos_list = dos_source.run[-1].calculation[-1].dos_electronic
+            # will overwrite bands efermi, if we can read this here.
+            # that is intended as the DOS fermi energy is more accurate
+            efermi = bands_child.run[-1].calculation[-1].energy.fermi
 
         if not dos_list:
             self.logger.info(
                 'No electronic DOS found - band structure only will be added '
                 'to aflow.in entry'
             )
-
-        dos_role = next(
-            (r for r in roles if child_archives.get(r) is dos_source),
-            'none',
-        )
 
         # Append a new combined Calculation to archive.run[0].
         # run[0] is the aflow.in run created in parse(). We append a fresh
@@ -688,9 +687,10 @@ class AFLOWParser:
         for dos in dos_list:
             sec_combined.dos_electronic.append(dos)
 
+        sec_combined.energy = Energy(fermi=efermi)
+
         self.logger.info(
             'Created combined DOS+bands Calculation on aflow.in entry',
-            dos_source_role=dos_role,
             n_dos=len(dos_list),
             n_bs=len(bs_list),
         )
