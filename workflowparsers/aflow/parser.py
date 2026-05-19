@@ -652,7 +652,7 @@ class AFLOWParser:
         if bands_child.run and bands_child.run[-1].calculation:
             bs_list = bands_child.run[-1].calculation[-1].band_structure_electronic
             efermi = bands_child.run[-1].calculation[-1].energy.fermi
-  
+
         if not bs_list:
             self.logger.warning(
                 'No band_structure_electronic in bands run - '
