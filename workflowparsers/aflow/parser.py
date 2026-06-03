@@ -54,6 +54,7 @@ from simulationworkflowschema import (
     ThermodynamicsResults,
 )
 from .metainfo import aflow  # noqa
+from .vasp_integration import add_vasp_workflow_to_aflow
 
 
 class AflowOutParser(TextParser):
@@ -119,6 +120,7 @@ class AflowInParser(AflowOutParser):
         super().init_quantities()
         self._quantities += [
             Quantity('aflow_version', r'Stefano Curtarolo \- \(AFLOW V([\d\.]+)\)'),
+            Quantity('vasp_run', r'\[VASP_RUN\](\S+)', dtype=str, convert=False),
             Quantity(
                 'poscar',
                 r'\[VASP_POSCAR_MODE_EXPLICIT\]START\s*([\s\S]+?)\[VASP_POSCAR_MODE_EXPLICIT\]STOP',
@@ -741,11 +743,6 @@ class AFLOWParser:
                 self.parse_agl()
             elif module == 'apl':
                 self.parse_apl()
-        
-        # ------------------------------------------------------------------
-        # Integrate VASP entries (band structure, DOS, workflow)
-        # ------------------------------------------------------------------
-        from .vasp_integration import add_vasp_entries_to_aflow
-        
+
         # Integrate pre-existing VASP entries: workflow, DOS, band structure
         add_vasp_workflow_to_aflow(self, archive, logger)

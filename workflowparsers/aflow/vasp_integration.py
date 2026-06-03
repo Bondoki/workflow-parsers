@@ -585,6 +585,108 @@ class AflowVaspWorkflowBuilder:
 
         self.archive.workflow2 = workflow
 
+    # ---- local fallback helpers ----
+
+    def _parse_vasp_runs_locally(
+        self, vasp_runs: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """Parse VASP files directly with VASPParser when search is unavailable.
+
+        Returns a dict ``{role: child_archive}`` just like
+        ``_load_child_archives`` does.
+        """
+        children: Dict[str, Any] = {}
+
+        try:
+            from electronicparsers.vasp import VASPParser
+            from nomad.datamodel import EntryArchive
+        except ImportError as exc:
+            self.logger.warning(
+                'VASPParser not available — cannot parse VASP files locally. '
+                'Install electronic-parsers: pip install electronic-parsers',
+                exc_info=exc,
+            )
+            return children
+
+        for role, filepath in vasp_runs.items():
+            self.logger.debug('Locally parsing VASP run "%s"', role)
+            child = EntryArchive()
+            try:
+                VASPParser().parse(filepath, child, self.logger)
+            except Exception as exc:
+                self.logger.warning(
+                    'Failed to parse VASP file %s', filepath, exc_info=exc
+                )
+                continue
+            children[role] = child
+            self.logger.info('Locally parsed VASP run "%s"', role)
+
+        return children
+
+    def _build_direct_ref_workflow(
+        self,
+        workflow_type: str,
+        roles: List[str],
+        children: Dict[str, Any],
+    ):
+        """Build a workflow using direct object references (for local parsing).
+
+        Used when NOMAD entry IDs are not available (local testing).  Creates
+        ``TaskReference`` and ``Link`` objects pointing directly at the
+        loaded archive sections rather than string-path references.
+        """
+        workflow = Workflow(name=f'AFLOW {workflow_type} Workflow')
+
+        tasks: List[Any] = []
+        for role in roles:
+            child = children.get(role)
+            if child is None:
+                continue
+
+            task = TaskReference()
+            task.name = role.upper()
+
+            input_structure = extract_section(child, ['run', 'system'])
+            vasp_calculation = extract_section(child, ['run', 'calculation'])
+
+            if input_structure is not None:
+                task.inputs = [
+                    Link(section=input_structure, name='Input Structure')
+                ]
+            if vasp_calculation is not None:
+                task.outputs = [
+                    Link(section=vasp_calculation, name='VASP Calculation')
+                ]
+
+            # Prefer workflow2 on child, fall back to last calculation
+            if self._calculation_has_section(child, '/workflow2'):
+                task.task = child.workflow2
+            elif child.run and child.run[-1].calculation:
+                task.task = child.run[-1].calculation[-1]
+
+            tasks.append(task)
+
+        workflow.tasks = tasks
+
+        # Global inputs / outputs
+        first_role = next((r for r in roles if r in children), None)
+        last_role = next((r for r in reversed(roles) if r in children), None)
+
+        if first_role:
+            first_input = extract_section(children[first_role], ['run', 'system'])
+            if first_input is not None:
+                workflow.inputs = [
+                    Link(section=first_input, name='Input structure')
+                ]
+        if last_role:
+            last_calc = extract_section(children[last_role], ['run', 'calculation'])
+            if last_calc is not None:
+                workflow.outputs = [
+                    Link(section=last_calc, name='Final result')
+                ]
+
+        self.archive.workflow2 = workflow
+
     # ---- top-level orchestration ----
 
     def parse_vasp_runs(self):
@@ -654,32 +756,43 @@ class AflowVaspWorkflowBuilder:
             upload_prefix=upload_prefix,
         )
 
-        # 5. Discover pre-existing VASP entries via search
+        # 5. Discover pre-existing VASP entries via search (preferred)
         discovered = self._discover_vasp_entries(vasp_runs, upload_prefix)
-        if not discovered:
+        search_based = False
+        children: Dict[str, Any] = {}
+
+        if discovered:
+            children = self._load_child_archives(discovered)
+            if children:
+                search_based = True
+
+        if not children:
+            self.logger.info(
+                'No pre-existing VASP entries found via search — '
+                'falling back to local VASP parsing'
+            )
+            children = self._parse_vasp_runs_locally(vasp_runs)
+
+        if not children:
             self.logger.warning(
-                'No pre-existing VASP entries discovered — skipping workflow'
+                'No VASP archives could be loaded or parsed'
             )
             return
 
-        # 6. Load their archives
-        children = self._load_child_archives(discovered)
-        if not children:
-            self.logger.warning('No VASP archives could be loaded')
-            return
-
-        # 7. Combine DOS + bands into AFLOW entry
+        # 6. Combine DOS + bands into AFLOW entry
         if 'bands' in children and len(children) > 1:
             self._combine_dos_and_bands(roles, children)
 
-        # 8. Build workflow2 with string-path references
-        self._build_workflow(
-            workflow_type, roles, vasp_runs, children, upload_prefix
-        )
+        # 7. Build workflow2
+        if search_based:
+            self._build_workflow(
+                workflow_type, roles, vasp_runs, children, upload_prefix
+            )
+        else:
+            self._build_direct_ref_workflow(workflow_type, roles, children)
 
         self.logger.info(
-            'Built AFLOW VASP workflow with %d task(s)',
-            len(children),
+            'Built AFLOW VASP workflow with %d task(s)', len(children)
         )
 
 
