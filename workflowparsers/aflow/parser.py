@@ -746,9 +746,6 @@ class AFLOWParser:
         # Integrate VASP entries (band structure, DOS, workflow)
         # ------------------------------------------------------------------
         from .vasp_integration import add_vasp_entries_to_aflow
-
-        add_vasp_entries_to_aflow(
-            self, archive, logger,
-            copy_bandstructure=True,
-            copy_dos=True,
-        )
+        
+        # Integrate pre-existing VASP entries: workflow, DOS, band structure
+        add_vasp_workflow_to_aflow(self, archive, logger)

@@ -16,61 +16,162 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Integration helpers for combining VASP entry data into AFLOW entries.
+"""Integration helpers for combining pre-existing VASP entry data into
+AFLOW entries.
 
-When an AFLOW mainfile (``aflow.in``) is co-located with compressed VASP
-output files (``vasprun.xml.???.xz``) that are parsed as separate VASP
-entries, this module discovers those entries, creates workflow links, and
-optionally copies electronic band structures and density of states into
-the AFLOW archive.
+This module is modelled after the ``parse_vasp_runs`` machinery in the
+``improved-aflow-parser-vasp-workflow`` branch, but replaces **local VASP
+parsing** with **search + archive loading** because the VASP files have
+already been parsed as separate entries by the electronic-parsers VASP
+parser.
+
+Design alignment with the branch
+----------------------------------
+* **Workflow type detection** — reads ``[VASP_RUN]`` from ``aflow.in``,
+  maps it to expected roles (``relax1..N``, ``static``, ``bands``).
+* **File discovery** — scans the directory for
+  ``vasprun.xml.<role>.(xz|bz2)`` using the same regex.
+* **Entry ID hashing** — reproduces NOMAD's internal hash
+  ``base64(sha512(upload_id + mainfile))`` so string-path references
+  line up with the entries created by the VASP parser.
+* **DOS + bands combination** — copies ``dos_electronic`` from the
+  ``static`` run and ``band_structure_electronic`` from the ``bands``
+  run into a combined ``Calculation`` on the AFLOW entry, exactly as
+the branch does.
+* **Workflow references** — uses ``/entries/<id>/archive#<path>`` strings
+  for ``TaskReference`` and ``Link`` objects, matching the branch's
+  reference style.
 
 Usage::
 
-    from .vasp_integration import AflowVaspIntegration
+    # Inside AFLOWParser.parse(), after all AFLOW-specific parsing:
+    from .vasp_integration import AflowVaspWorkflowBuilder
+    builder = AflowVaspWorkflowBuilder(parser, archive, logger)
+    builder.parse_vasp_runs()
 
-    # Inside AFLOWParser.parse(), after the initial parsing:
-    integration = AflowVaspIntegration(parser, archive, logger)
-    integration.add_vasp_workflow()          # link VASP entries as workflow tasks
-    integration.copy_vasp_band_structures()  # optionally copy BS data
-    integration.copy_vasp_dos()              # optionally copy DOS data
-
-Design rationale
-------------------
-* **Discovery** is done via :py:func:`nomad.search.search` because the VASP
-  entries are separate mainfile-entries in the same upload (and usually the
-  same directory).
-* **Archive loading** uses :py:meth:`archive.m_context.load_archive`, the
-  same pattern used by the LOBSTER parser in this repository.
-* **Workflow linking** uses :py:class:`TaskReference` and :py:class:`Link`
-  from ``nomad.datamodel.metainfo.workflow``, which creates lazy references
-  that resolve when the data is accessed.
-* **Data copying** (optional) creates new metainfo objects for band
-  structures / DOS rather than sharing references, avoiding side effects
-  between archives.
+Each step can also be called individually for debugging.
 """
 
 import os
-from typing import List, Dict, Optional, Any
+import re
+import base64
+import hashlib
+import logging
+from typing import Dict, List, Optional, Any
 
 from nomad.search import search
 from nomad.app.v1.models import MetadataRequired
-from nomad.datamodel.metainfo.workflow import TaskReference, Link, Task
-from nomad.utils import extract_section
-from simulationworkflowschema import SerialSimulation
-from runschema.calculation import (
-    Calculation,
-    Dos,
-    DosValues,
-    BandStructure,
-    BandEnergies,
+from nomad.datamodel.metainfo.workflow import Workflow, TaskReference, Link
+from runschema.calculation import Calculation, Energy, Dos, DosValues
+from runschema.calculation import BandStructure, BandEnergies
+
+
+# ------------------------------------------------------------------
+# Helper functions (identical logic to the branch)
+# ------------------------------------------------------------------
+
+AFLOW_VASPRUN_RE = re.compile(
+    r'^vasprun\.xml\.(relax(\d+)|static(\d+)?|bands)\.(xz|bz2)$'
 )
 
+VASP_RUN_ROLES = {
+    'GENERATE': [],
+    'STATIC': ['static'],
+    'STATIC_BANDS': ['static', 'bands'],
+    'RELAX': ['relax1'],
+    'RELAX_STATIC': ['relax1', 'static'],
+    'RELAX_STATIC_BANDS': ['relax1', 'static', 'bands'],
+}
 
-class AflowVaspIntegration:
-    """Discovers VASP entries related to an AFLOW entry and merges their data.
+
+def find_vasp_runs(maindir: str) -> Dict[str, str]:
+    """Scan *maindir* for ``vasprun.xml.<suffix>.xz/.bz2`` files.
+
+    Returns an ``OrderedDict`` keyed by normalised role name, sorted in
+    canonical AFLOW execution order: relax1 .. relaxN, static, bands.
+    """
+    found = {}
+    for fname in sorted(os.listdir(maindir)):
+        m = AFLOW_VASPRUN_RE.match(fname)
+        if not m:
+            continue
+        suffix = m.group(1)
+        role = re.sub(r'^static\d+$', 'static', suffix)
+        if role not in found:
+            found[role] = os.path.join(maindir, fname)
+
+    def _sort_key(role):
+        rm = re.match(r'^relax(\d+)$', role)
+        if rm:
+            return (0, int(rm.group(1)))
+        return {'static': (1, 0), 'bands': (2, 0)}.get(role, (3, 0))
+
+    return dict(sorted(found.items(), key=lambda kv: _sort_key(kv[0])))
+
+
+def parse_vasp_run_directive(vasp_run_str: Optional[str]):
+    """Parse the raw ``[VASP_RUN]`` value from *aflow.in*.
+
+    Returns ``(workflow_type, n_relax)`` where *n_relax* defaults to 2
+    for any RELAX variant.
+    """
+    if not vasp_run_str:
+        return None, 0
+    parts = vasp_run_str.strip().split('=')
+    workflow_type = parts[0].strip()
+    if len(parts) > 1:
+        try:
+            n_relax = int(parts[1].strip())
+        except ValueError:
+            n_relax = 2
+    else:
+        n_relax = 2 if 'RELAX' in workflow_type else 0
+    return workflow_type, n_relax
+
+
+def expected_roles_from_directive(workflow_type: str, n_relax: int) -> List[str]:
+    """Build the ordered list of expected VASP run roles.
+
+    Expands the ``'relax1'`` placeholder into
+    ``['relax1', 'relax2', .., 'relaxN']``.
+    """
+    base = list(VASP_RUN_ROLES.get(workflow_type, []))
+    if 'relax1' in base and n_relax > 1:
+        relax_roles = [f'relax{i}' for i in range(1, n_relax + 1)]
+        idx = base.index('relax1')
+        base = base[:idx] + relax_roles + base[idx + 1 :]
+    return base
+
+
+def infer_workflow_type(roles: List[str]) -> str:
+    """Infer the AFLOW workflow type from whichever roles were found."""
+    has_relax = any(re.match(r'^relax\d+$', r) for r in roles)
+    has_static = 'static' in roles
+    has_bands = 'bands' in roles
+
+    if has_relax and has_static and has_bands:
+        return 'RELAX_STATIC_BANDS'
+    if has_relax and has_static:
+        return 'RELAX_STATIC'
+    if has_static and has_bands:
+        return 'STATIC_BANDS'
+    if has_relax:
+        return 'RELAX'
+    if has_static:
+        return 'STATIC'
+    return 'UNKNOWN'
+
+
+# ------------------------------------------------------------------
+# Main builder class
+# ------------------------------------------------------------------
+
+class AflowVaspWorkflowBuilder:
+    """Discovers pre-existing VASP entries and links them into the AFLOW archive.
 
     Args:
-        parser: The ``AFLOWParser`` instance (provides ``filepath``, ``maindir``).
+        parser: The ``AFLOWParser`` instance (provides ``filepath``,
+                ``maindir``, ``aflow_data``).
         archive: The AFLOW ``EntryArchive`` being populated.
         logger: A logger instance (may be ``None``).
     """
@@ -78,392 +179,524 @@ class AflowVaspIntegration:
     def __init__(self, parser, archive, logger=None):
         self.parser = parser
         self.archive = archive
-        self.logger = logger
-        self._vasp_entries: List[Dict[str, Any]] = []
-        self._vasp_archives: List[Any] = []
+        self.logger = logger if logger is not None else logging
 
-    # ------------------------------------------------------------------
-    # Discovery
-    # ------------------------------------------------------------------
+    # ---- entry ID helpers (same hash as the branch) ----
 
-    def find_vasp_entries(self) -> List[Dict[str, Any]]:
-        """Search the upload for VASP entries in the same directory as ``aflow.in``.
+    def _compute_entry_id(self, mainfile_rel: str) -> Optional[str]:
+        """Reproduce NOMAD's internal hash for a mainfile path.
 
-        Returns:
-            List of search-result dicts with keys ``entry_id``, ``mainfile``,
-            ``parser_name``.
+        Returns first 28 chars of URL-safe base64(SHA-512(upload_id + path)).
         """
-        self._vasp_entries = []
-
+        upload_id = None
         try:
             upload_id = self.archive.metadata.upload_id
         except AttributeError:
-            if self.logger:
-                self.logger.warning(
-                    'Cannot discover VASP entries: upload_id not set on archive.'
-                )
-            return self._vasp_entries
+            try:
+                upload_id = self.archive.m_context.upload_id
+            except AttributeError:
+                pass
 
-        parent_dir = os.path.dirname(self.parser.filepath)
+        if upload_id is None:
+            # For fully local runs with no upload context, fall back to
+            # using the parent directory name as a deterministic pseudo-ID.
+            upload_id = os.path.dirname(mainfile_rel)
+
+        raw = hashlib.sha512((upload_id + mainfile_rel).encode()).digest()
+        return base64.urlsafe_b64encode(raw).decode().rstrip('=')[:28]
+
+    def _ref(self, entry_id: str, path: str) -> str:
+        """Return a NOMAD archive reference string."""
+        return f'/entries/{entry_id}/archive#{path}'
+
+    # ---- section helpers ----
+
+    @staticmethod
+    def _last_system_index(child) -> int:
+        try:
+            return len(child.run[-1].system) - 1
+        except Exception:
+            return -1
+
+    @staticmethod
+    def _last_calc_index(child) -> int:
+        try:
+            return len(child.run[-1].calculation) - 1
+        except Exception:
+            return -1
+
+    @staticmethod
+    def _calculation_has_section(child, path: str) -> bool:
+        """Check whether *path* resolves in *child*."""
+        try:
+            parts = [p for p in path.strip('/').split('/') if p]
+            obj = child
+            for part in parts:
+                if part.lstrip('-').isdigit():
+                    obj = obj[int(part)]
+                else:
+                    obj = getattr(obj, part)
+            return obj is not None
+        except Exception:
+            return False
+
+    # ---- discovery via search ----
+
+    def _discover_vasp_entries(
+        self, vasp_runs: Dict[str, str], upload_prefix: str = ''
+    ) -> Dict[str, Any]:
+        """Find the NOMAD search entries matching each VASP file on disk.
+
+        Returns a dict ``{role: search_result_dict}`` where each result
+        contains at minimum ``entry_id`` and ``mainfile``.
+        """
+        discovered: Dict[str, Any] = {}
+
+        # Resolve upload_id (metadata is preferred; fall back to context)
+        upload_id = None
+        try:
+            upload_id = self.archive.metadata.upload_id
+        except AttributeError:
+            try:
+                upload_id = self.archive.m_context.upload_id
+            except AttributeError:
+                pass
+
+        if not upload_id:
+            self.logger.warning(
+                'Cannot discover VASP entries: upload_id not available.'
+            )
+            return discovered
+
+        # Resolve user_id for visibility filtering (same pattern as LOBSTER)
+        user_id = None
+        try:
+            user_id = self.archive.metadata.main_author.user_id
+        except Exception:
+            pass
+
+        self.logger.info(
+            'Searching for VASP entries: upload_id=%s user_id=%s',
+            upload_id, user_id,
+        )
 
         try:
             results = search(
                 owner='visible',
+                user_id=user_id,
                 query={'upload_id': upload_id},
                 required=MetadataRequired(
                     include=['entry_id', 'mainfile', 'parser_name']
                 ),
             ).data
         except Exception as exc:
-            if self.logger:
-                self.logger.warning(
-                    'Search for VASP entries failed.', exc_info=exc
-                )
-            return self._vasp_entries
+            self.logger.warning(
+                'Search for VASP entries failed (may not be available locally).',
+                exc_info=exc,
+            )
+            return discovered
 
+        self.logger.info('Search returned %d total entries', len(results))
+
+        # Index by mainfile for O(1) lookups
+        by_mainfile: Dict[str, Any] = {}
         for result in results:
-            if 'vasp' not in result.get('parser_name', '').lower():
+            parser_name = result.get('parser_name', '').lower()
+            if 'vasp' not in parser_name:
                 continue
-            entry_mainfile = result.get('mainfile')
-            if not entry_mainfile:
-                continue
-            # Match entries that sit in exactly the same directory.
-            # In AFLOW, VASP runs for AEL/AGL/APL are stored in sub-folders
-            # (e.g. ``ARUN.AEL_0_SF_N_1_0.99/vasprun.xml.001.xz``), so we
-            # also accept sub-directories.
-            entry_dir = os.path.dirname(entry_mainfile)
-            if entry_dir == parent_dir or entry_dir.startswith(
-                parent_dir + os.sep
-            ):
-                self._vasp_entries.append(result)
+            mf = result.get('mainfile')
+            if mf:
+                by_mainfile[mf] = result
+                self.logger.debug(
+                    '  VASP entry found: mainfile=%s entry_id=%s',
+                    mf, result.get('entry_id'),
+                )
 
-        if self.logger:
+        self.logger.info(
+            'Indexed %d VASP entries by mainfile', len(by_mainfile)
+        )
+
+        for role, filepath in vasp_runs.items():
+            fname = os.path.basename(filepath)
+            rel_path = os.path.join(upload_prefix, fname) if upload_prefix else fname
+
+            # Build a set of path variants to try for matching
+            candidates = {rel_path, fname}
+            # Normalise slashes (NOMAD search always uses /; os.path may use \)
+            candidates.add(rel_path.replace('\\', '/'))
+            candidates.add(
+                './' + rel_path.replace('\\', '/').lstrip('./\\')
+            )
+            # Basename-only variants
+            candidates.add(fname)
+            candidates.add('./' + fname)
+            # Strip leading ./ from rel_path
+            candidates.add(rel_path.lstrip('./\\'))
+
+            entry = None
+            matched_path = None
+            for candidate in candidates:
+                if candidate in by_mainfile:
+                    entry = by_mainfile[candidate]
+                    matched_path = candidate
+                    break
+
+            if entry is None:
+                # Diagnostic: log what we tried vs what's available
+                available = sorted(by_mainfile.keys())
+                self.logger.warning(
+                    'No pre-existing VASP entry found for role "%s". '
+                    'Tried: %s.  Available VASP mainfiles: %s',
+                    role,
+                    sorted(candidates),
+                    available[:20],  # cap length
+                )
+                continue
+
+            discovered[role] = entry
             self.logger.info(
-                'Discovered %d VASP entries for AFLOW entry.',
-                len(self._vasp_entries),
+                'Matched VASP entry %s → role "%s" (via path %s)',
+                entry.get('entry_id'), role, matched_path,
             )
 
-        return self._vasp_entries
+        return discovered
 
-    # ------------------------------------------------------------------
-    # Loading
-    # ------------------------------------------------------------------
-
-    def load_vasp_archives(self) -> List[Any]:
-        """Load every discovered VASP archive via ``m_context.load_archive``.
-
-        Returns:
-            List of loaded VASP ``EntryArchive`` objects.
-        """
-        self._vasp_archives = []
-        if not self._vasp_entries:
-            self.find_vasp_entries()
+    def _load_child_archives(
+        self, discovered: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Load each discovered VASP archive via ``m_context.load_archive``."""
+        children: Dict[str, Any] = {}
 
         try:
             upload_id = self.archive.metadata.upload_id
         except AttributeError:
-            if self.logger:
-                self.logger.warning('Cannot load VASP archives: no upload_id.')
-            return self._vasp_archives
+            self.logger.warning('Cannot load VASP archives: no upload_id')
+            return children
 
-        for entry in self._vasp_entries:
+        for role, entry in discovered.items():
             entry_id = entry.get('entry_id')
-            mainfile = entry.get('mainfile')
             if not entry_id:
                 continue
             try:
-                vasp_archive = self.archive.m_context.load_archive(
+                child = self.archive.m_context.load_archive(
                     entry_id, upload_id, None
                 )
-                self._vasp_archives.append(vasp_archive)
-                if self.logger:
-                    self.logger.debug(
-                        'Loaded VASP archive for %s', mainfile
-                    )
+                children[role] = child
+                self.logger.debug('Loaded VASP archive for role "%s"', role)
             except Exception as exc:
-                if self.logger:
-                    self.logger.warning(
-                        'Failed to load VASP archive %s.', mainfile, exc_info=exc
-                    )
-
-        return self._vasp_archives
-
-    # ------------------------------------------------------------------
-    # Workflow construction
-    # ------------------------------------------------------------------
-
-    def add_vasp_workflow(self, workflow_name: str = 'AFLOW VASP Workflow'):
-        """Create a ``SerialSimulation`` workflow that links all VASP entries.
-
-        Each VASP entry becomes a task inside the workflow.  The AFLOW
-        workflow itself is stored in ``archive.workflow2``.
-
-        The tasks are ``TaskReference`` objects pointing to each VASP entry's
-        ``workflow2`` section.  This keeps the data in the original VASP
-        archives and avoids duplication.
-        """
-        if not self._vasp_archives:
-            self.load_vasp_archives()
-        if not self._vasp_archives:
-            return
-
-        workflow = SerialSimulation(name=workflow_name)
-
-        # Optionally promote an existing AFLOW sub-workflow (Elastic, Phonon …)
-        # into the first task so it is not lost.
-        existing_workflow = getattr(self.archive, 'workflow2', None)
-        if existing_workflow is not None:
-            aflow_task = TaskReference(task=existing_workflow, name='AFLOW run')
-            workflow.tasks.append(aflow_task)
-
-        for idx, vasp_archive in enumerate(self._vasp_archives, start=1):
-            vasp_workflow = getattr(vasp_archive, 'workflow2', None)
-            if vasp_workflow is None:
-                # Fallback: craft a minimal workflow from the VASP run data
-                vasp_workflow = SerialSimulation(
-                    name=f'VASP calculation {idx}'
+                self.logger.warning(
+                    'Failed to load VASP archive for role "%s"', role, exc_info=exc
                 )
 
-            task = TaskReference(task=vasp_workflow)
-            task.name = f'VASP calculation {idx}'
+        return children
 
-            # Extract a structure and calculation section from the VASP
-            # archive so that the task has explicit inputs / outputs.
-            input_structure = extract_section(
-                vasp_archive, ['run', 'system']
+    # ---- combination logic (identical to the branch) ----
+
+    def _combine_dos_and_bands(
+        self, roles: List[str], children: Dict[str, Any]
+    ):
+        """Create a combined DOS + band structure view on the AFLOW entry.
+
+        A new ``Calculation`` is appended to ``archive.run[0]`` containing:
+          - ``band_structure_electronic`` copied from the ``bands`` run
+          - ``dos_electronic`` copied from the ``static`` (or last relax) run
+
+        Neither VASP child archive is modified.
+        """
+        if 'bands' not in children:
+            return
+
+        bands_child = children['bands']
+        bs_list = []
+        efermi = None
+
+        if bands_child.run and bands_child.run[-1].calculation:
+            calc = bands_child.run[-1].calculation[-1]
+            bs_list = list(calc.band_structure_electronic)
+            try:
+                efermi = calc.energy.fermi
+            except Exception:
+                pass
+
+        if not bs_list:
+            self.logger.warning(
+                'No band_structure_electronic in bands run — '
+                'skipping combined plot on aflow.in entry'
             )
-            vasp_calculation = extract_section(
-                vasp_archive, ['run', 'calculation']
+            return
+
+        # Prefer DOS from static; fall back to last available calculation
+        dos_source = children.get('static')
+        dos_list = []
+        if dos_source is not None and dos_source.run and dos_source.run[-1].calculation:
+            calc = dos_source.run[-1].calculation[-1]
+            dos_list = list(calc.dos_electronic)
+            try:
+                efermi = calc.energy.fermi
+            except Exception:
+                pass
+
+        if not dos_list:
+            self.logger.info(
+                'No electronic DOS found — band structure only will be added '
+                'to aflow.in entry'
             )
 
-            if input_structure is not None:
+        sec_combined = Calculation()
+        # run[0] is the aflow.in-run created in AFLOWParser.parse()
+        self.archive.run[0].calculation.append(sec_combined)
+
+        for src_bs in bs_list:
+            target_bs = BandStructure()
+            sec_combined.band_structure_electronic.append(target_bs)
+            for src_seg in src_bs.segment:
+                target_seg = BandEnergies()
+                target_bs.segment.append(target_seg)
+                target_seg.kpoints = src_seg.kpoints
+                target_seg.energies = src_seg.energies
+                if src_seg.endpoints_labels is not None:
+                    target_seg.endpoints_labels = list(src_seg.endpoints_labels)
+
+        for src_dos in dos_list:
+            target_dos = Dos()
+            sec_combined.dos_electronic.append(target_dos)
+            target_dos.energies = src_dos.energies
+            for src_val in src_dos.total:
+                target_dos.total.append(DosValues(value=src_val.value))
+
+        sec_combined.energy = Energy(fermi=efermi)
+
+        self.logger.info(
+            'Created combined DOS+bands Calculation on aflow.in entry',
+            n_dos=len(dos_list),
+            n_bs=len(bs_list),
+        )
+
+    # ---- workflow builder (identical reference style to the branch) ----
+
+    def _build_workflow(
+        self,
+        workflow_type: str,
+        roles: List[str],
+        vasp_runs: Dict[str, str],
+        children: Dict[str, Any],
+        upload_prefix: str = '',
+    ):
+        """Construct a ``workflow2`` on the AFLOW archive linking all runs.
+
+        Uses string-path references (``/entries/<id>/archive#<path>``) so
+        NOMAD resolves them lazily.
+        """
+        workflow = Workflow(name=f'AFLOW {workflow_type} Workflow')
+
+        # Map roles → computed entry IDs (for reference strings)
+        entry_ids: Dict[str, Optional[str]] = {}
+        for role, filepath in vasp_runs.items():
+            fname = os.path.basename(filepath)
+            rel = os.path.join(upload_prefix, fname) if upload_prefix else fname
+            eid = self._compute_entry_id(rel)
+            entry_ids[role] = eid
+
+        tasks: List[Any] = []
+        prev_role = None
+
+        for role in roles:
+            eid = entry_ids.get(role)
+            child = children.get(role)
+            if eid is None or child is None:
+                prev_role = role
+                continue
+
+            task = TaskReference()
+            task.name = role.upper()
+
+            # inputs: structure from previous run, or own first system
+            if (
+                prev_role
+                and entry_ids.get(prev_role)
+                and children.get(prev_role)
+            ):
+                prev_eid = entry_ids[prev_role]
+                prev_child = children[prev_role]
+                last_sys = self._last_system_index(prev_child)
                 task.inputs = [
-                    Link(section=input_structure, name='Input Structure')
+                    Link(
+                        name=f'Structure from {prev_role.upper()}',
+                        section=self._ref(prev_eid, f'/run/0/system/{last_sys}'),
+                    )
                 ]
-            if vasp_calculation is not None:
+            else:
+                if self._calculation_has_section(child, '/run/0/system/0'):
+                    task.inputs = [
+                        Link(
+                            name='Input structure',
+                            section=self._ref(eid, '/run/0/system/0'),
+                        )
+                    ]
+
+            # outputs: last calculation
+            last_calc = self._last_calc_index(child)
+            if last_calc >= 0:
                 task.outputs = [
-                    Link(section=vasp_calculation, name='VASP Calculation')
+                    Link(
+                        name=f'{role.upper()} result',
+                        section=self._ref(eid, f'/run/0/calculation/{last_calc}'),
+                    )
                 ]
 
-            workflow.tasks.append(task)
+            # task reference: prefer workflow2, fall back to calculation itself
+            if self._calculation_has_section(child, '/workflow2'):
+                task.task = self._ref(eid, '/workflow2')
+            elif last_calc >= 0:
+                task.task = self._ref(eid, f'/run/0/calculation/{last_calc}')
 
-        # Store the combined workflow
+            tasks.append(task)
+            prev_role = role
+
+        workflow.tasks = tasks
+
+        # Global workflow inputs / outputs
+        first_role = next(
+            (r for r in roles if r in entry_ids and r in children), None
+        )
+        last_role = next(
+            (r for r in reversed(roles) if r in entry_ids and r in children), None
+        )
+
+        if first_role:
+            workflow.inputs = [
+                Link(
+                    name='Input structure',
+                    section=self._ref(entry_ids[first_role], '/run/0/system/0'),
+                )
+            ]
+        if last_role:
+            last_calc = self._last_calc_index(children[last_role])
+            if last_calc >= 0:
+                workflow.outputs = [
+                    Link(
+                        name='Final result',
+                        section=self._ref(
+                            entry_ids[last_role],
+                            f'/run/0/calculation/{last_calc}',
+                        ),
+                    )
+                ]
+
         self.archive.workflow2 = workflow
 
-        if self.logger:
+    # ---- top-level orchestration ----
+
+    def parse_vasp_runs(self):
+        """Main entry point — discover, load, combine, and link VASP entries.
+
+        Called from ``AFLOWParser.parse()`` after the AFLOW-specific data
+        has been written.
+        """
+        # 1. Detect workflow type from [VASP_RUN] directive
+        vasp_run_str = None
+        if hasattr(self.parser, 'aflowin_parser') and self.parser.aflowin_parser:
+            vasp_run_str = getattr(self.parser.aflowin_parser, 'vasp_run', None)
+        if vasp_run_str is None:
+            vasp_run_str = self.parser.aflow_data.get('vasp_run')
+
+        workflow_type, n_relax = parse_vasp_run_directive(vasp_run_str)
+
+        # 2. Find VASP files on disk
+        vasp_runs = find_vasp_runs(self.parser.maindir)
+        if not vasp_runs:
+            self.logger.info('No vasprun.xml.*.xz files found alongside aflow.in')
+            return
+
+        # 3. Build expected role list
+        if workflow_type is not None:
+            expected = expected_roles_from_directive(workflow_type, n_relax)
+        else:
             self.logger.info(
-                'Built AFLOW-VASP workflow with %d VASP task(s).',
-                len(self._vasp_archives),
+                '[VASP_RUN] absent — inferring workflow type from files on disk'
             )
+            expected = list(vasp_runs.keys())
+            workflow_type = infer_workflow_type(expected)
+            n_relax = sum(1 for r in expected if re.match(r'^relax\d+$', r))
 
-    # ------------------------------------------------------------------
-    # Data extraction helpers
-    # ------------------------------------------------------------------
+        # Warn about missing expected roles
+        for role in expected:
+            if role not in vasp_runs:
+                self.logger.warning(
+                    'Expected role "%s" from [VASP_RUN]=%s not found on disk',
+                    role, vasp_run_str,
+                )
 
-    @staticmethod
-    def _get_vasp_calculation(vasp_archive) -> Optional[Any]:
-        """Return the last calculation from the first ``run`` in a VASP archive."""
+        # Merge expected + unexpected roles
+        roles = list(expected)
+        for role in vasp_runs:
+            if role not in roles:
+                self.logger.info(
+                    'Unexpected VASP run "%s" found on disk — including anyway',
+                    role,
+                )
+                roles.append(role)
+
+        # 4. Upload prefix for entry ID hashing
         try:
-            run = vasp_archive.run[0]
-            if not run.calculation:
-                return None
-            return run.calculation[-1]
+            upload_root = self.archive.m_context.raw_path()
+            upload_prefix = os.path.relpath(self.parser.maindir, upload_root)
+            if upload_prefix == '.':
+                upload_prefix = ''
         except Exception:
-            return None
+            upload_prefix = ''
 
-    @staticmethod
-    def _copy_band_structure(
-        source_bse: BandStructure, target_calc: Calculation
-    ) -> BandStructure:
-        """Deep-copy a ``band_structure_electronic`` entry into *target_calc*.
+        self.logger.info(
+            'AFLOW VASP workflow configuration',
+            workflow_type=workflow_type,
+            n_relax=n_relax,
+            roles=roles,
+            upload_prefix=upload_prefix,
+        )
 
-        Creates fresh metainfo objects so that the new data belongs to the
-        AFLOW archive and not to the VASP archive.
-        """
-        target_bse = BandStructure()
-        target_calc.band_structure_electronic.append(target_bse)
-
-        for source_seg in source_bse.segment:
-            target_seg = BandEnergies()
-            target_bse.segment.append(target_seg)
-
-            target_seg.kpoints = source_seg.kpoints
-            target_seg.energies = source_seg.energies
-            if source_seg.endpoints_labels is not None:
-                target_seg.endpoints_labels = list(source_seg.endpoints_labels)
-
-        return target_bse
-
-    @staticmethod
-    def _copy_dos(source_dos: Dos, target_calc: Calculation) -> Dos:
-        """Deep-copy a ``dos_electronic`` entry into *target_calc*.
-
-        Copies energies and the ``total`` channel.  If atom/orbital-projected
-        channels exist they are copied as well.
-        """
-        target_dos = Dos()
-        target_calc.dos_electronic.append(target_dos)
-
-        target_dos.energies = source_dos.energies
-
-        if source_dos.total:
-            for source_val in source_dos.total:
-                target_val = DosValues(value=source_val.value)
-                target_dos.total.append(target_val)
-
-        if source_dos.partial:
-            for source_val in source_dos.partial:
-                target_val = DosValues(
-                    value=source_val.value,
-                    atom_label=getattr(source_val, 'atom_label', None),
-                    m_state=getattr(source_val, 'm_state', None),
-                    l_state=getattr(source_val, 'l_state', None),
-                )
-                target_dos.partial.append(target_val)
-
-        return target_dos
-
-    # ------------------------------------------------------------------
-    # Public copy API
-    # ------------------------------------------------------------------
-
-    def copy_vasp_band_structures(self):
-        """Copy every electronic band structure from each VASP entry into AFLOW.
-
-        A new ``Calculation`` is appended to the *last* AFLOW ``run`` for
-        every VASP entry that contains a ``band_structure_electronic``.
-        """  # noqa: D401
-        if not self._vasp_archives:
-            self.load_vasp_archives()
-        if not self._vasp_archives:
-            return
-
-        try:
-            aflow_run = self.archive.run[-1]
-        except IndexError:
-            if self.logger:
-                self.logger.warning(
-                    'No run section in AFLOW archive; skipping band-structure copy.'
-                )
-            return
-
-        copied = 0
-        for vasp_archive in self._vasp_archives:
-            vasp_calc = self._get_vasp_calculation(vasp_archive)
-            if vasp_calc is None or not vasp_calc.band_structure_electronic:
-                continue
-
-            aflow_calc = Calculation()
-            aflow_run.calculation.append(aflow_calc)
-
-            for source_bse in vasp_calc.band_structure_electronic:
-                self._copy_band_structure(source_bse, aflow_calc)
-                copied += 1
-
-        if self.logger:
-            self.logger.info(
-                'Copied %d electronic band structure(s) from VASP into AFLOW.',
-                copied,
+        # 5. Discover pre-existing VASP entries via search
+        discovered = self._discover_vasp_entries(vasp_runs, upload_prefix)
+        if not discovered:
+            self.logger.warning(
+                'No pre-existing VASP entries discovered — skipping workflow'
             )
-
-    def copy_vasp_dos(self):
-        """Copy every electronic DOS from each VASP entry into AFLOW.
-
-        A new ``Calculation`` is appended to the *last* AFLOW ``run`` for
-        every VASP entry that contains a ``dos_electronic``.
-        """  # noqa: D401
-        if not self._vasp_archives:
-            self.load_vasp_archives()
-        if not self._vasp_archives:
             return
 
-        try:
-            aflow_run = self.archive.run[-1]
-        except IndexError:
-            if self.logger:
-                self.logger.warning(
-                    'No run section in AFLOW archive; skipping DOS copy.'
-                )
+        # 6. Load their archives
+        children = self._load_child_archives(discovered)
+        if not children:
+            self.logger.warning('No VASP archives could be loaded')
             return
 
-        copied = 0
-        for vasp_archive in self._vasp_archives:
-            vasp_calc = self._get_vasp_calculation(vasp_archive)
-            if vasp_calc is None or not vasp_calc.dos_electronic:
-                continue
+        # 7. Combine DOS + bands into AFLOW entry
+        if 'bands' in children and len(children) > 1:
+            self._combine_dos_and_bands(roles, children)
 
-            aflow_calc = Calculation()
-            aflow_run.calculation.append(aflow_calc)
+        # 8. Build workflow2 with string-path references
+        self._build_workflow(
+            workflow_type, roles, vasp_runs, children, upload_prefix
+        )
 
-            for source_dos in vasp_calc.dos_electronic:
-                self._copy_dos(source_dos, aflow_calc)
-                copied += 1
-
-        if self.logger:
-            self.logger.info(
-                'Copied %d electronic DOS object(s) from VASP into AFLOW.',
-                copied,
-            )
-
-    # ------------------------------------------------------------------
-    # Convenience one-shot helpers
-    # ------------------------------------------------------------------
-
-    def add_workflow_and_copy_data(self):
-        """Run the full integration: workflow + band structure + DOS."""
-        self.add_vasp_workflow()
-        self.copy_vasp_band_structures()
-        self.copy_vasp_dos()
-
-    def add_workflow_keep_references(self):
-        """Run only workflow linking; do **not** copy band structure / DOS data.
-
-        This is the preferred mode when disk space or data duplication is a
-        concern, because the AFLOW entry will only hold lightweight
-        ``TaskReference`` and ``Link`` objects pointing at the VASP archives.
-        """
-        self.add_vasp_workflow()
+        self.logger.info(
+            'Built AFLOW VASP workflow with %d task(s)',
+            len(children),
+        )
 
 
-# --------------------------------------------------------------------------
-# Stand-alone integration function (drop-in for AFLOWParser.parse)
-# --------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Stand-alone convenience function
+# ------------------------------------------------------------------
 
-def add_vasp_entries_to_aflow(
-    parser,
-    archive,
-    logger=None,
-    *,
-    copy_bandstructure: bool = False,
-    copy_dos: bool = False,
-) -> AflowVaspIntegration:
-    """Discover VASP entries, build workflow links, and optionally copy data.
+def add_vasp_workflow_to_aflow(parser, archive, logger=None):
+    """One-shot helper to be called from ``AFLOWParser.parse()``.
 
-    Typical call site inside ``AFLOWParser.parse()``::
+    Typical call site::
 
         def parse(self, filepath, archive, logger):
             # ... existing AFLOW parsing ...
 
-            from .vasp_integration import add_vasp_entries_to_aflow
-            add_vasp_entries_to_aflow(
-                self, archive, logger,
-                copy_bandstructure=True, copy_dos=True
-            )
-
-    Args:
-        parser: The ``AFLOWParser`` instance.
-        archive: The ``EntryArchive`` being populated.
-        logger: Logger (may be ``None``).
-        copy_bandstructure: If ``True``, copy electronic band-structure data.
-        copy_dos: If ``True``, copy electronic DOS data.
-
-    Returns:
-        The :py:class:`AflowVaspIntegration` instance that performed the work.
+            from .vasp_integration import add_vasp_workflow_to_aflow
+            add_vasp_workflow_to_aflow(self, archive, logger)
     """
-    integration = AflowVaspIntegration(parser, archive, logger)
-    integration.add_vasp_workflow()
-    if copy_bandstructure:
-        integration.copy_vasp_band_structures()
-    if copy_dos:
-        integration.copy_vasp_dos()
-    return integration
+    builder = AflowVaspWorkflowBuilder(parser, archive, logger)
+    builder.parse_vasp_runs()
