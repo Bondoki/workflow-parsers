@@ -741,3 +741,14 @@ class AFLOWParser:
                 self.parse_agl()
             elif module == 'apl':
                 self.parse_apl()
+        
+        # ------------------------------------------------------------------
+        # Integrate VASP entries (band structure, DOS, workflow)
+        # ------------------------------------------------------------------
+        from .vasp_integration import add_vasp_entries_to_aflow
+
+        add_vasp_entries_to_aflow(
+            self, archive, logger,
+            copy_bandstructure=True,
+            copy_dos=True,
+        )
