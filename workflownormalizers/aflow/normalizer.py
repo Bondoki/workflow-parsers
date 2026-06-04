@@ -33,7 +33,7 @@ from runschema.calculation import (
 )
 
 configuration = config.get_plugin_entry_point(
-    'workflownormalizers.aflow:aflow_vasp_normalizer_entry_point'
+    'workflownormalizers:aflow_vasp_normalizer_entry_point'
 )
 
 
