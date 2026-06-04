@@ -62,6 +62,7 @@ aflow_parser_entry_point = EntryPoint(
     mainfile_alternative=True,
     supported_compressions=['gz', 'bz2', 'xz'],
     parser_class_name='workflowparsers.aflow.AFLOWParser',
+    level=3, # as it may depends on the VASP parser
     code_name='AFLOW',
     code_homepage='http://www.aflowlib.org/',
     code_category='Workflow manager',

@@ -207,7 +207,8 @@ class AflowVaspWorkflowBuilder:
 
     def _ref(self, entry_id: str, path: str) -> str:
         """Return a NOMAD archive reference string."""
-        return f'/entries/{entry_id}/archive#{path}'
+        #return f'/entries/{entry_id}/archive#{path}'
+        return f'../upload/archive/{entry_id}#{path}'
 
     # ---- section helpers ----
 
@@ -456,7 +457,7 @@ class AflowVaspWorkflowBuilder:
                 target_seg.energies = src_seg.energies
                 if src_seg.endpoints_labels is not None:
                     target_seg.endpoints_labels = list(src_seg.endpoints_labels)
-
+        
         for src_dos in dos_list:
             target_dos = Dos()
             sec_combined.dos_electronic.append(target_dos)
@@ -465,6 +466,11 @@ class AflowVaspWorkflowBuilder:
                 target_dos.total.append(DosValues(value=src_val.value))
 
         sec_combined.energy = Energy(fermi=efermi)
+        
+        #sec_combined.system_ref = self._ref(dos_source.metadata.entry_id, '/run/0/system/0')
+        #sec_combined.system_ref = self._ref(bands_child.metadata.entry_id, '/run/0/system/0')
+        #sec_combined.method_ref = self._ref(bands_child.metadata.entry_id, '/run/0/method/0') 
+
 
         self.logger.info(
             'Created combined DOS+bands Calculation on aflow.in entry',
@@ -780,8 +786,8 @@ class AflowVaspWorkflowBuilder:
             return
 
         # 6. Combine DOS + bands into AFLOW entry
-        if 'bands' in children and len(children) > 1:
-            self._combine_dos_and_bands(roles, children)
+        #if 'bands' in children and len(children) > 1:
+        #    self._combine_dos_and_bands(roles, children)
 
         # 7. Build workflow2
         if search_based:
