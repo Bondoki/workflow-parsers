@@ -8,5 +8,10 @@ For AFLOW, the following files will be parsed:
 |`aflowlib.json` | **Mainfile:** a json file containing the aflow output|
 |`aflow.ael.out`| plain text, elastic outputs|
 |`aflow.agl.out` | plain text, Debye model output|
+|--- | --- |
+|`aflow.in` | **Mainfile:** a text file containing the aflow output|
+|`vasprun.xml.static.xz`| plain text, VASP output for density of states|
+|`vasprun.xml.bands.xz`| plain text, VASP output for band structure|
+|`vasprun.xml.relaxXXX.xz`| plain text, VASP output for step XXX in relaxation|
 
 

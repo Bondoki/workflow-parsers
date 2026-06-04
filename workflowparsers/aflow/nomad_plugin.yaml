@@ -22,6 +22,15 @@ metadata:
 
     |`aflow.agl.out` | plain text, Debye model output|
 
+    |--- | --- |
+    
+    |`aflow.in` | **Mainfile:** a text file containing the aflow output|
+    
+    |`vasprun.xml.static.xz`| plain text, VASP output for density of states|
+    
+    |`vasprun.xml.bands.xz`| plain text, VASP output for band structure|
+    
+    |`vasprun.xml.relaxXXX.xz`| plain text, VASP output for step XXX in relaxation|
     '
 name: parsers/aflow
 parser_class_name: workflowparsers.aflow.parser.AFLOWParser
