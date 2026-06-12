@@ -99,105 +99,53 @@ class AflowVaspNormalizer(Normalizer):
             # dos_list = []
             # efermi = None
             
+            bs_source_archive = None
+            dos_source_archive = None
+
             if file_exists:
                 main_path = archive.metadata.mainfile.rpartition('/')[0]
-                bands_filename = main_path+'/vasprun.xml.bands.xz' if main_path else 'vasprun.xml.bands.xz' # no directory if on root level
-                # bands_filename = 'vasprun.xml.bands.xz'
-                bands_archive = archive.m_context.load_archive(self.get_entry_id(uploadid, bands_filename), uploadid, None)#, self.get_reference(uploadid, self.get_entry_id(uploadid, bands_filename)))
-                # self.logger.info('Access bands_archive')
+                bands_filename = main_path+'/vasprun.xml.bands.xz' if main_path else 'vasprun.xml.bands.xz'
+                bands_archive = archive.m_context.load_archive(self.get_entry_id(uploadid, bands_filename), uploadid, None)
 
-                # Collect band structure from bands run
-                #bands_child = child_archives['bands']
-                # bs_list = []
                 if bands_archive.run and bands_archive.run[-1].calculation:
                     self.logger.info('Access bands_archive')
                     bs_list = bands_archive.run[-1].calculation[-1].band_structure_electronic
                     efermi = bands_archive.run[-1].calculation[-1].energy.fermi
+                    bs_source_archive = bands_archive
 
-                #sec_combined = Calculation()
-                #archive.run[0].calculation.append(sec_combined)
-
-                #for bs in bs_list:
-                #    sec_combined.band_structure_electronic.append(bs)
-                #    self.logger.info(f'archive.metadata.mainfile: {archive.metadata.mainfile} - added bs calculation')
-            
             if file_exists_static:
                 main_path = archive.metadata.mainfile.rpartition('/')[0]
                 static_filename = main_path+'/vasprun.xml.static.xz' if main_path else 'vasprun.xml.static.xz'
-                static_archive = archive.m_context.load_archive(self.get_entry_id(uploadid, static_filename), uploadid, None)#, self.get_reference(uploadid, self.get_entry_id(uploadid, bands_filename)))
-                # self.logger.info('Access static_archive')
+                static_archive = archive.m_context.load_archive(self.get_entry_id(uploadid, static_filename), uploadid, None)
 
-                # Collect band structure from bands run
-                #bands_child = child_archives['bands']
-                # dos_list = []
                 if static_archive.run and static_archive.run[-1].calculation:
                     self.logger.info('Access static_archive')
                     dos_list = static_archive.run[-1].calculation[-1].dos_electronic
                     # will overwrite bands efermi, if we can read this here.
                     # that is intended as the DOS fermi energy is more accurate
                     efermi = static_archive.run[-1].calculation[-1].energy.fermi
-                    # efermi = bands_child.run[-1].calculation[-1].energy.fermi
+                    dos_source_archive = static_archive
+
+                    # Fallback: if no bands file, take BS from static
+                    if bs_source_archive is None:
+                        bs_list = static_archive.run[-1].calculation[-1].band_structure_electronic
+                        bs_source_archive = static_archive
 
             sec_combined = Calculation()
             archive.run[0].calculation.append(sec_combined)
 
             for bs in bs_list:
                 sec_combined.band_structure_electronic.append(bs)
-                #sec_combined.system_ref = self._ref(dos_source.metadata.entry_id, '/run/0/system/0')
-                sec_combined.system_ref = self._ref(bands_archive.metadata.entry_id, '/run/0/system/0')
-                sec_combined.method_ref = self._ref(bands_archive.metadata.entry_id, '/run/0/method/0') 
                 self.logger.info(f'archive.metadata.mainfile: {archive.metadata.mainfile} - added bs calculation')
 
             for dos in dos_list:
                 sec_combined.dos_electronic.append(dos)
                 self.logger.info(f'archive.metadata.mainfile: {archive.metadata.mainfile} - added dos calculation')
 
+            if bs_source_archive is not None:
+                sec_combined.system_ref = self._ref(bs_source_archive.metadata.entry_id, '/run/0/system/0')
+                sec_combined.method_ref = self._ref(bs_source_archive.metadata.entry_id, '/run/0/method/0')
+
             sec_combined.energy = Energy(fermi=efermi)
 
-
-            #self.logger.info(f'band run calculation {bands_archive.run[-1].calculation}')
-            #with archive.m_context.raw_file('vasprun.xml.bands.xz', 'r') as file:
-
-            #    sample_dict = (
-            #        yaml.safe_load(file)
-            #        if 'vasprun.xml.bands.xz'.split('.')[-1] == 'yaml'
-            #        else json.load(file)
-            #    )
-            #    sample_dict['data']['fresh'] = True
-        #aflow_data = archive.run[0].calculation
-        # structure = aflow_data.atom_labels  # Example: Extract structure info
-
-
-        #bands_archive = archive.m_context.load_archive(
-        #        entry_id=target_entry_id,
-        #        upload_id=upload_id,
-        #        installation_url=archive.m_context.installation_url
-        #)
-        #band_archive = archive.get_reference('vasp.xml.bands.xz')
-        # results = archive.m_get('vasp.xml.bands.xz')
-        # results = archive.find_entries(filename='vasp.xml.bands.xz')
-        #print(band_archive)
-        # Access parsed band structure data
-        # band_archive = archive.m_context.open_archive('vasprun.xml.bands.xz')
-        # band_archive = archive.m_context.load_archive('vasprun.xml.bands.xz')
-        #if band_archive:
-        #    self.logger.info('Band structure data found.')
-        #    band_structure = band_archive.run[-1].calculation
-        #else:
-        #    self.logger.warning('Band structure data not found.')
-
-        # Access parsed DOS data
-        #dos_archive = archive.m_context.open_archive('vasprun.xml.static.xz')
-        #if dos_archive:
-        #    self.logger.info('DOS data found.')
-        #    dos = dos_archive.section_dos
-        #else:
-        #    self.logger.warning('DOS data not found.')
-
-        # Combine data into a unified section
-        #if band_structure and dos:
-        #    combined_section = archive.m_create(archive.run[0].m_create_section('section_combined'))
-        #    combined_section.band_structure = band_structure
-        #    combined_section.dos = dos
-        #    combined_section.structure = structure  # Add metadata from aflow.in
 
