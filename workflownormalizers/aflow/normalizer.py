@@ -99,6 +99,8 @@ class AflowVaspNormalizer(Normalizer):
             # dos_list = []
             # efermi = None
             
+            bands_archive = None
+            static_archive = None
             bs_source_archive = None
             dos_source_archive = None
 
