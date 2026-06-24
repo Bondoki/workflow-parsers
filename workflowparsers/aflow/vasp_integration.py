@@ -506,6 +506,10 @@ class AflowVaspWorkflowBuilder:
         tasks: List[Any] = []
         prev_role = None
 
+        # Identify specific roles needed for wiring
+        relax_roles = [r for r in roles if re.match(r'^relax\d+$', r)]
+        last_relax_role = relax_roles[-1] if relax_roles else None
+
         for role in roles:
             eid = entry_ids.get(role)
             child = children.get(role)
@@ -516,12 +520,55 @@ class AflowVaspWorkflowBuilder:
             task = TaskReference()
             task.name = role.upper()
 
-            # inputs: structure from previous run, or own first system
-            if (
+            is_relax = re.match(r'^relax\d+$', role) is not None
+            is_bands = role == 'bands'
+            is_static = role == 'static'
+
+            # ---- inputs ----
+            if is_bands:
+                # BANDS: inputs = System from last RELAX + Calculation from STATIC
+                inputs: List[Any] = []
+                if (
+                    last_relax_role
+                    and entry_ids.get(last_relax_role)
+                    and children.get(last_relax_role)
+                ):
+                    relax_eid = entry_ids[last_relax_role]
+                    relax_child = children[last_relax_role]
+                    last_sys = self._last_system_index(relax_child)
+                    if last_sys >= 0:
+                        inputs.append(
+                            Link(
+                                name=f'Structure from {last_relax_role.upper()}',
+                                section=self._ref(
+                                    relax_eid, f'/run/0/system/{last_sys}'
+                                ),
+                            )
+                        )
+                if (
+                    'static' in entry_ids
+                    and entry_ids['static']
+                    and children.get('static')
+                ):
+                    static_eid = entry_ids['static']
+                    static_child = children['static']
+                    last_calc = self._last_calc_index(static_child)
+                    if last_calc >= 0:
+                        inputs.append(
+                            Link(
+                                name='Calculation from STATIC',
+                                section=self._ref(
+                                    static_eid, f'/run/0/calculation/{last_calc}'
+                                ),
+                            )
+                        )
+                task.inputs = inputs
+            elif (
                 prev_role
                 and entry_ids.get(prev_role)
                 and children.get(prev_role)
             ):
+                # RELAX1+ / STATIC: input = last System from previous task
                 prev_eid = entry_ids[prev_role]
                 prev_child = children[prev_role]
                 last_sys = self._last_system_index(prev_child)
@@ -532,6 +579,7 @@ class AflowVaspWorkflowBuilder:
                     )
                 ]
             else:
+                # First task: own first system
                 if self._calculation_has_section(child, '/run/0/system/0'):
                     task.inputs = [
                         Link(
@@ -540,17 +588,30 @@ class AflowVaspWorkflowBuilder:
                         )
                     ]
 
-            # outputs: last calculation
-            last_calc = self._last_calc_index(child)
-            if last_calc >= 0:
-                task.outputs = [
-                    Link(
-                        name=f'{role.upper()} result',
-                        section=self._ref(eid, f'/run/0/calculation/{last_calc}'),
-                    )
-                ]
+            # ---- outputs ----
+            if is_relax:
+                # RELAX tasks output their last System
+                last_sys = self._last_system_index(child)
+                if last_sys >= 0:
+                    task.outputs = [
+                        Link(
+                            name=f'{role.upper()} result',
+                            section=self._ref(eid, f'/run/0/system/{last_sys}'),
+                        )
+                    ]
+            else:
+                # STATIC / BANDS output their last Calculation
+                last_calc = self._last_calc_index(child)
+                if last_calc >= 0:
+                    task.outputs = [
+                        Link(
+                            name=f'{role.upper()} result',
+                            section=self._ref(eid, f'/run/0/calculation/{last_calc}'),
+                        )
+                    ]
 
             # task reference: prefer workflow2, fall back to calculation itself
+            last_calc = self._last_calc_index(child)
             if self._calculation_has_section(child, '/workflow2'):
                 task.task = self._ref(eid, '/workflow2')
             elif last_calc >= 0:
@@ -561,14 +622,10 @@ class AflowVaspWorkflowBuilder:
 
         workflow.tasks = tasks
 
-        # Global workflow inputs / outputs
+        # ---- Global workflow inputs ----
         first_role = next(
             (r for r in roles if r in entry_ids and r in children), None
         )
-        last_role = next(
-            (r for r in reversed(roles) if r in entry_ids and r in children), None
-        )
-
         if first_role:
             workflow.inputs = [
                 Link(
@@ -576,18 +633,56 @@ class AflowVaspWorkflowBuilder:
                     section=self._ref(entry_ids[first_role], '/run/0/system/0'),
                 )
             ]
-        if last_role:
-            last_calc = self._last_calc_index(children[last_role])
-            if last_calc >= 0:
-                workflow.outputs = [
+
+        # ---- Global workflow outputs ----
+        workflow_outputs: List[Any] = []
+
+        # 1. System of RELAX2 (or last relax)
+        if last_relax_role and children.get(last_relax_role):
+            relax_eid = entry_ids[last_relax_role]
+            relax_child = children[last_relax_role]
+            last_sys = self._last_system_index(relax_child)
+            if last_sys >= 0:
+                workflow_outputs.append(
                     Link(
-                        name='Final result',
+                        name=f'Final structure ({last_relax_role.upper()})',
                         section=self._ref(
-                            entry_ids[last_role],
-                            f'/run/0/calculation/{last_calc}',
+                            relax_eid, f'/run/0/system/{last_sys}'
                         ),
                     )
-                ]
+                )
+
+        # 2. Calculation of STATIC
+        if 'static' in children and children['static']:
+            static_eid = entry_ids['static']
+            static_child = children['static']
+            last_calc = self._last_calc_index(static_child)
+            if last_calc >= 0:
+                workflow_outputs.append(
+                    Link(
+                        name='STATIC result',
+                        section=self._ref(
+                            static_eid, f'/run/0/calculation/{last_calc}'
+                        ),
+                    )
+                )
+
+        # 3. Calculation of BANDS
+        if 'bands' in children and children['bands']:
+            bands_eid = entry_ids['bands']
+            bands_child = children['bands']
+            last_calc = self._last_calc_index(bands_child)
+            if last_calc >= 0:
+                workflow_outputs.append(
+                    Link(
+                        name='BANDS result',
+                        section=self._ref(
+                            bands_eid, f'/run/0/calculation/{last_calc}'
+                        ),
+                    )
+                )
+
+        workflow.outputs = workflow_outputs
 
         self.archive.workflow2 = workflow
 
